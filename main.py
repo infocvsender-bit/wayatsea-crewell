@@ -1198,7 +1198,10 @@ async def main():
     # при запуске — сразу одна проверка, если сейчас рабочее время (между первым и последним запуском + 1 час)
     now = london_now()
     first, last = SCHEDULE[0], SCHEDULE[-1]
-    if (now.hour, now.minute) >= first and now.hour <= last[0]:
+    if os.getenv("RUN_NOW", "").lower() in ("1", "true", "yes"):
+        log("🚀 RUN_NOW=1 — проверяю сразу, вне расписания")
+        await run_all(sent)
+    elif (now.hour, now.minute) >= first and now.hour <= last[0]:
         log("🚀 Запуск в рабочее время — проверяю сразу")
         await run_all(sent)
 
