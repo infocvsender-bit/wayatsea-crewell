@@ -103,6 +103,8 @@ async def send_to_site(job):
         "source": job.get("source", "crewell"),
         "external_id": job["id"],
         "region": job.get("region", ""),
+        "vessel_name": job.get("vessel_name", ""),
+        "phone": job.get("phone", ""),
         "url": job["url"],
         "title": job["rank"],
         "rank": job["rank"],
@@ -319,7 +321,7 @@ def make_message(job):
         t = re.sub(r"[^A-Za-z0-9]", "", v or "")
         if t:
             tags.append("#" + t)
-    tags.append("#MerchantFleet")
+    tags.append(job.get("fleet_tag") or "#MerchantFleet")
     lines.append(" ".join(dict.fromkeys(tags)))
     return "\n".join(lines)
 
@@ -702,6 +704,455 @@ async def scan_atlas(sent):
         f"не Offshore Marine {stats['not_marine']}, нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
 
 
+# ============================================================
+# TOS PEOPLE (jobs.tospeople.com) — robots.txt разрешает всё
+#  • Даты публикации на сайте нет. Номера вакансий растут (10659, 10658…),
+#    поэтому «новые» = номер больше запомненного. При самом первом запуске
+#    парсер берёт последние 15 (TOS_FIRST_TAKE) и запоминает номер; дальше — только то, что появится после.
+#    (TOS_START_ID=10650 — взять всё, что новее этого номера.)
+#  • Только морские разделы: Maritime, Offshore, Towage, Dredging, Ship Delivery.
+#  • Имейл консультанта — со страницы вакансии (…@tospeople.com).
+# ============================================================
+
+TOS = os.getenv("TOS", "1").lower() not in ("0", "false", "no")
+TOS_BASE = "https://jobs.tospeople.com"
+TOS_STATE = Path(os.getenv("TOS_STATE_FILE", "tos_state.json"))
+TOS_FIRST_TAKE = int(os.getenv("TOS_FIRST_TAKE", "15") or 15)   # сколько последних взять при первом запуске
+TOS_MARINE = re.compile(r"\b(maritime|offshore|towage|dredging|ship delivery)\b", re.I)
+TOS_LAND = re.compile(r"\b(onshore|port\s*&\s*logistics|logistics)\b", re.I)
+
+TOS_RANKS = [
+    (r"\bmaster\b|\bcaptain\b|\bskipper\b", "Master"), (r"\bc/?o\b|chief\s+(officer|mate)", "Chief Officer"),
+    (r"\bc/?e\b|chief\s+engineer", "Chief Engineer"), (r"\b2/?o\b|second\s+officer|2nd\s+officer", "Second Officer"),
+    (r"\b2/?e\b|second\s+engineer|2nd\s+engineer", "Second Engineer"), (r"\b3/?o\b|third\s+officer|3rd\s+officer", "Third Officer"),
+    (r"\b3/?e\b|third\s+engineer|3rd\s+engineer", "Third Engineer"), (r"\beto\b|electro.?technical", "ETO"),
+    (r"\belectrician\b", "Electrician"), (r"\bdpo\b|dynamic\s+positioning", "DPO"), (r"\bbosun\b|boatswain", "Bosun"),
+    (r"\bab\b|able\s+seaman", "AB"), (r"\bos\b|ordinary\s+seaman", "OS"), (r"\bdeckhand\b", "Deckhand"),
+    (r"\boiler\b", "Oiler"), (r"\bmotorman\b", "Motorman"), (r"\bfitter\b", "Fitter"), (r"\bcook\b", "Cook"),
+    (r"\bsteward\b|messman", "Steward"), (r"\bcrane\s+operator\b", "Crane Operator"),
+]
+
+
+def tos_ranks(title):
+    found = []
+    for rx, name in TOS_RANKS:
+        if re.search(rx, title or "", re.I) and name not in found:
+            found.append(name)
+    return found
+
+
+def _tos_state():
+    try:
+        return json.loads(TOS_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _tos_save(st):
+    try:
+        TOS_STATE.write_text(json.dumps(st), encoding="utf-8")
+    except Exception:
+        pass
+
+
+TOS_JS = r"""() => {
+    const h = document.querySelector('h1');
+    const title = h ? h.innerText.trim() : '';
+    const body = document.body.innerText || '';
+    let t = title ? body.slice(Math.max(0, body.indexOf(title))) : body;
+    const cut = t.search(/\n\s*(similar (jobs|vacancies)|other vacancies|related jobs|share this|apply now\s*\n\s*first name)/i);
+    if (cut > 0) t = t.slice(0, cut);
+    const mails = [...document.querySelectorAll('a[href^="mailto:"]')].map(a => a.href.replace(/^mailto:/i, '').split('?')[0]);
+    return {title, text: t.slice(0, 6000), full: body.slice(0, 20000), mails};
+}"""
+
+
+def tos_parse(d, url, vid):
+    title = (d.get("title") or "").strip()
+    lines = [re.sub(r"\s*\t+\s*", ": ", x).strip() for x in (d.get("text") or "").splitlines() if x.strip()]
+    text = "\n".join(lines)
+
+    emails = [e.lower() for e in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", (d.get("full") or "") + " " + " ".join(d.get("mails") or []))]
+    emails = [e for e in dict.fromkeys(emails) if not re.match(r"^(no-?reply|privacy|gdpr|dpo)@", e)]
+    generic = re.compile(r"^(info|contact|hello|admin|office|careers|jobs|recruitment|hr)@")
+    personal = [e for e in emails if "tospeople" in e and not generic.match(e)]
+    email = (personal or [e for e in emails if "tospeople" in e] or emails or [""])[0]
+
+    ranks = tos_ranks(title)
+    clean_title = re.sub(r"^\s*we\s+are\s+looking\s+for\s+", "", title, flags=re.I).strip()
+    m = re.search(r"\bfor\s+(?:an?\s+|the\s+)?([^,;]+?)\s*$", clean_title, re.I)
+    vessel = m.group(1).strip() if m and ranks else ""
+    mc = re.search(r"\bfor\s+(?:an?\s+|the\s+)?(?:full\s+set\s+)?(?:crew\s+for\s+)?([A-Za-z0-9 /&-]+?)\s+crew\b", clean_title, re.I)
+    if not vessel and mc:
+        vessel = mc.group(1).strip()
+    if not vessel:
+        mf = re.search(r"crew\s+for\s+(?:an?\s+|the\s+)?(.+)$", clean_title, re.I)
+        vessel = mf.group(1).strip() if mf else ""
+    if not vessel:
+        me = re.fullmatch(r"(?:full\s+set\s+)?([A-Za-z0-9 /&-]+?)\s+crew", clean_title.strip(), re.I)
+        vessel = me.group(1).strip() if me else ""
+    vessel = re.sub(r"^(full\s+set|set)\s+", "", vessel, flags=re.I)
+    if len(ranks) == 1:
+        rank = ranks[0]
+    elif ranks or re.search(r"\bcrew\b", clean_title, re.I):
+        rank = "Multiple positions"
+    else:
+        rank = clean_title[:120]
+
+    region = field(lines, "location", "region", "country", "work location", "locatie")
+    if not region:
+        for x in lines[1:10]:
+            if re.fullmatch(r"(south|north|east|west|southeast|south-east|middle)?\s*[A-Z][A-Za-z ,&-]{2,40}", x) and not TOS_MARINE.fullmatch(x.strip()):
+                if re.search(r"asia|europe|africa|america|middle east|netherlands|indonesia|singapore|malaysia|uk|norway|brazil|gulf|sea", x, re.I):
+                    region = x.strip()
+                    break
+
+    drop_rx = re.compile(r"^(apply|share|back|location|workfield|category|contact|contact person|©)\b|@|^©", re.I)
+    # имена консультантов (строка перед e-mail) не нужны в описании
+    names = {lines[i - 1] for i, x in enumerate(lines) if i and "@" in x}
+    info = "\n".join(x for x in lines[1:] if not drop_rx.search(x) and x.strip() != region and x not in names
+                     and not TOS_MARINE.fullmatch(x.strip()) and not TOS_LAND.fullmatch(x.strip()))[:2500]
+    if len(ranks) > 1:
+        info = ("Positions: " + ", ".join(ranks) + "\n" + info).strip()
+    others = [e for e in emails if e != email and "tospeople" in e]
+    if others:
+        info += "\nAlso: " + ", ".join(others[:2])
+
+    return {
+        "source": "tospeople",
+        "id": vid,
+        "url": url,
+        "rank": rank[:120],
+        "vessel_type": (" ".join(w if len(w) <= 5 else w.capitalize() for w in vessel.split()) if vessel.isupper() else vessel)[:100],
+        "region": region[:120],
+        "join": field(lines, "start date", "start", "joining", "mobilisation", "mobilization")[:100],
+        "duration": field(lines, "duration", "rotation", "contract")[:100],
+        "salary": field(lines, "salary", "day rate", "rate")[:100],
+        "email": email,
+        "company": "TOS",
+        "info": info,
+        "fleet_tag": "#OffshoreFleet" if re.search(r"\boffshore\b|\b(psv|ahts|errv|mpsv|osv|dsv|csv|crew\s*boat|crewboat|fpso|jack.?up|rig)\b", text + " " + title, re.I) else "#MerchantFleet",
+        "_marine": bool(TOS_MARINE.search(text)) and not (TOS_LAND.search(text) and not TOS_MARINE.search(text)),
+        "_title": title,
+    }
+
+
+async def scan_tos(sent):
+
+    if not TOS:
+        return
+
+    log("")
+    log(f"=== TOS PEOPLE SCAN {london_now().strftime('%Y-%m-%d %H:%M')} ===")
+    stats = {"new": 0, "duplicate": 0, "skipped": 0, "not_marine": 0, "no_email": 0, "error": 0}
+    st = _tos_state()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
+        ctx = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+        page = await ctx.new_page()
+
+        try:
+            ids = {}
+
+            async def grab_list(url):
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                hrefs = await page.locator("a[href*='/job-posting/']").evaluate_all("els => els.map(e => e.href)")
+                got = 0
+                for h in hrefs:
+                    m = re.search(r"/job-posting/(\d+)(/[^?#]*)?", h)
+                    if m and int(m.group(1)) not in ids:
+                        ids[int(m.group(1))] = f"{TOS_BASE}/en/job-posting/{m.group(1)}{m.group(2) or ''}"
+                        got += 1
+                # ссылка на следующую страницу, если есть
+                nxt = await page.evaluate("""() => {
+                    const a = [...document.querySelectorAll('a[href]')].find(x => /[?&]page=2\\b|\\/page\\/2\\b/.test(x.href)
+                        || /^(next|volgende|›|»|>)$/i.test((x.innerText || x.getAttribute('aria-label') || '').trim()));
+                    return a ? a.href : null;
+                }""")
+                return got, nxt
+
+            got, nxt = await grab_list(f"{TOS_BASE}/en?lang=eng")
+            # вторая–третья страницы (нужно на первом запуске, чтобы набрать 15 последних)
+            for extra in [nxt, f"{TOS_BASE}/en?lang=eng&page=2", f"{TOS_BASE}/en?page=2&lang=eng"]:
+                if len(ids) >= TOS_FIRST_TAKE or not extra:
+                    break
+                try:
+                    g, _ = await grab_list(extra)
+                    if g:
+                        break
+                except Exception:
+                    pass
+
+            if not ids:
+                log("⚠️ TOS: на странице списка не нашёл вакансий")
+                return
+
+            last = st.get("last_id") or int(os.getenv("TOS_START_ID", "0") or 0)
+            if not last:
+                # первый запуск: берём последние TOS_FIRST_TAKE (по умолчанию 15) и дальше — только новее
+                newest = sorted(ids, reverse=True)[:TOS_FIRST_TAKE]
+                last = min(newest) - 1
+                log(f"📌 TOS: первый запуск — беру последние {len(newest)} вакансий (номера {min(newest)}–{max(newest)}) и запоминаю")
+
+            fresh = sorted(i for i in ids if i > last)
+            log(f"🗂 TOS: в списке {len(ids)}, новых (номер > {last}): {len(fresh)}")
+
+            for i in fresh:
+                key = f"tospeople:{i}"
+                if key in sent:
+                    continue
+                url = ids[i]
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    d = await page.evaluate(TOS_JS)
+                except Exception as e:
+                    stats["error"] += 1
+                    log(f"❌ TOS {i}: {type(e).__name__}")
+                    continue
+
+                job = tos_parse(d, url, str(i))
+
+                if not job.pop("_marine"):
+                    stats["not_marine"] += 1
+                    log(f"⏭ TOS {i}: не морской раздел — «{job['_title'][:60]}»")
+                    job.pop("_title", None)
+                    sent.add(key)
+                    continue
+                job.pop("_title", None)
+
+                if not job["email"]:
+                    stats["no_email"] += 1
+                    log(f"⛔ TOS {i}: нет e-mail — пропуск")
+                    sent.add(key)
+                    continue
+
+                if stats["new"] + stats["duplicate"] + stats["skipped"] < 2:
+                    log("🔎 TOS пример: " + json.dumps({k: v for k, v in job.items() if k != "info"}, ensure_ascii=False))
+
+                site = await send_to_site(job)
+                if site is False:
+                    stats["error"] += 1
+                    continue
+                stats[site] += 1
+                sent.add(key)
+                save_sent(sent)
+
+                if site == "new" and not SITE_ONLY:
+                    await to_bot(make_message(job), "tospeople")
+
+                await asyncio.sleep(3)
+
+            if stats["error"] == 0:
+                st["last_id"] = max([last] + fresh)
+                _tos_save(st)
+
+        finally:
+            await browser.close()
+            save_sent(sent)
+
+    log(f"=== TOS DONE: новых {stats['new']}, дублей {stats['duplicate']}, не морские/мусор {stats['skipped']}, "
+        f"не морской раздел {stats['not_marine']}, нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
+
+
+# ============================================================
+# SEA-MAN.ORG (crew.sea-man.org) — robots.txt разрешает /vacancies/ и /vac/
+#  • Список подгружается в браузере (Playwright его видит), вакансия: /vac/ID/.
+#  • Имейл и телефон компании видны без входа.
+#  • Даты публикации нет, номера растут → как у TOS: первый запуск — последние 15, потом только новее.
+# ============================================================
+
+SEAMAN = os.getenv("SEAMAN", "1").lower() not in ("0", "false", "no")
+SEAMAN_BASE = "https://crew.sea-man.org"
+SEAMAN_FIRST_TAKE = int(os.getenv("SEAMAN_FIRST_TAKE", "15") or 15)
+
+SEAMAN_JS = r"""() => {
+    const h = document.querySelector('h1');
+    const body = document.body.innerText || '';
+    const title = h ? h.innerText.trim() : (document.title || '');
+    let t = body;
+    const i = h ? body.indexOf(h.innerText.trim()) : -1;
+    if (i > 0) t = body.slice(i);
+    const cut = t.search(/\n\s*(similar vacancies|other vacancies|похожие вакансии|cookie|we value your privacy)/i);
+    if (cut > 0) t = t.slice(0, cut);
+    const mails = [...document.querySelectorAll('a[href^="mailto:"]')].map(a => a.href.replace(/^mailto:/i, '').split('?')[0]);
+    const tels = [...document.querySelectorAll('a[href^="tel:"]')].map(a => a.href.replace(/^tel:/i, ''));
+    return {title, text: t.slice(0, 8000), mails, tels};
+}"""
+
+
+def seaman_parse(d, url, vid):
+    title = re.sub(r"\s*\|\s*apply now\s*$", "", (d.get("title") or "").strip(), flags=re.I)
+    lines = [re.sub(r"\s*\t+\s*", ": ", x).strip() for x in (d.get("text") or "").splitlines() if x.strip()]
+    lines = [re.sub(r"^([^:]{2,40}):\s*:\s*", r"\1: ", x) for x in lines]
+    text = "\n".join(lines)
+
+    def f(*labs):
+        v = field(lines, *labs)
+        return "" if v in ("—", "-", "–") else v
+
+    rank = f("rank", "position", "должность")
+    vessel = f("vessel type", "type of vessel", "ship type", "тип судна")
+    m = re.match(r"\s*(.+?)\s+on\s+(.+?)(?:,\s*([^,|]+?))?\s*$", title, re.I)
+    if m:
+        rank = rank or m.group(1)
+        vessel = vessel or m.group(2)
+    salary = f("salary", "wage", "зарплата") or (m.group(3) if m and m.group(3) else "")
+
+    emails = [e.lower() for e in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text + " " + " ".join(d.get("mails") or []))]
+    emails = [e for e in dict.fromkeys(emails) if "sea-man.org" not in e and not re.match(r"^(no-?reply|privacy|gdpr)@", e)]
+    phone = (d.get("tels") or [""])[0] or f("phone", "tel", "телефон")
+
+    extra = [("DWT", f("dwt")), ("Built", f("built", "year of build", "year built", "год постройки")), ("Flag", f("flag", "флаг")),
+             ("Engine", f("engine", "main engine", "двигатель")), ("Citizenship", f("citizenship", "nationality", "гражданство")),
+             ("English", f("english", "english level", "английский"))]
+    desc = f("description", "описание", "about the vacancy", "requirements", "требования")
+    info = "\n".join(f"{k}: {v}" for k, v in extra if v)
+    if desc:
+        info = (info + "\n" + desc).strip()
+
+    return {
+        "source": "seaman",
+        "id": vid,
+        "url": url,
+        "rank": rank[:120],
+        "vessel_type": vessel[:100],
+        "vessel_name": f("vessel name", "ship name", "название судна")[:120],
+        "region": f("region", "trading area", "регион")[:120],
+        "join": f("join date", "joining date", "date of joining", "дата посадки")[:100],
+        "duration": f("duration", "contract duration", "длительность", "контракт")[:100],
+        "salary": salary[:100],
+        "email": emails[0] if emails else "",
+        "phone": phone[:60],
+        "company": f("company", "crewing company", "employer", "компания", "крюинг")[:120],
+        "info": info[:3000],
+    }
+
+
+async def scan_seaman(sent):
+
+    if not SEAMAN:
+        return
+
+    log("")
+    log(f"=== SEA-MAN SCAN {london_now().strftime('%Y-%m-%d %H:%M')} ===")
+    stats = {"new": 0, "duplicate": 0, "skipped": 0, "no_email": 0, "error": 0}
+    st = _tos_state()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
+        ctx = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+        page = await ctx.new_page()
+
+        try:
+            ids = set()
+            try:
+                await page.goto(f"{SEAMAN_BASE}/vacancies/", wait_until="domcontentloaded", timeout=60000)
+                try:
+                    await page.wait_for_selector("a[href*='/vac/']", timeout=20000)
+                except Exception:
+                    pass
+                for h in await page.locator("a[href*='/vac/']").evaluate_all("els => els.map(e => e.href)"):
+                    m = re.search(r"/vac/(\d+)", h)
+                    if m:
+                        ids.add(int(m.group(1)))
+            except Exception as e:
+                log(f"⚠️ Sea-man: список не открылся: {type(e).__name__}")
+
+            last = st.get("seaman_last") or int(os.getenv("SEAMAN_START_ID", "0") or 0)
+
+            if not ids and last:
+                # список не прогрузился — проверяем следующие номера подряд
+                ids = set(range(last + 1, last + 31))
+                log("⚠️ Sea-man: список не прогрузился — проверяю номера подряд")
+
+            if not ids:
+                log("⚠️ Sea-man: вакансий не нашёл")
+                return
+
+            if not last:
+                newest = sorted(ids, reverse=True)[:SEAMAN_FIRST_TAKE]
+                last = min(newest) - 1
+                log(f"📌 Sea-man: первый запуск — беру последние {len(newest)} (номера {min(newest)}–{max(newest)}) и запоминаю")
+
+            fresh = sorted(i for i in ids if i > last)
+            log(f"🗂 Sea-man: в списке {len(ids)}, новых (номер > {last}): {len(fresh)}")
+            top = last
+            misses = 0
+
+            for i in fresh:
+                key = f"seaman:{i}"
+                if key in sent:
+                    top = max(top, i)
+                    continue
+                url = f"{SEAMAN_BASE}/vac/{i}/"
+                try:
+                    r = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    if r and r.status == 404:
+                        misses += 1
+                        if misses >= 10:
+                            break
+                        continue
+                    await page.wait_for_timeout(1200)
+                    d = await page.evaluate(SEAMAN_JS)
+                except Exception as e:
+                    stats["error"] += 1
+                    log(f"❌ Sea-man {i}: {type(e).__name__}")
+                    continue
+
+                job = seaman_parse(d, url, str(i))
+                if not job["rank"]:
+                    misses += 1
+                    continue
+                misses = 0
+                top = max(top, i)
+
+                if not job["email"]:
+                    stats["no_email"] += 1
+                    log(f"⛔ Sea-man {i}: нет e-mail — пропуск")
+                    sent.add(key)
+                    continue
+
+                if stats["new"] + stats["duplicate"] + stats["skipped"] < 2:
+                    log("🔎 Sea-man пример: " + json.dumps({k: v for k, v in job.items() if k != "info"}, ensure_ascii=False))
+
+                if join_expired(job["join"]):
+                    sent.add(key)
+                    continue
+
+                site = await send_to_site(job)
+                if site is False:
+                    stats["error"] += 1
+                    continue
+                stats[site] += 1
+                sent.add(key)
+                save_sent(sent)
+
+                if site == "new" and not SITE_ONLY:
+                    await to_bot(make_message(job), "seaman")
+
+                await asyncio.sleep(3)
+
+            if stats["error"] == 0:
+                st["seaman_last"] = max(top, st.get("seaman_last") or 0)
+                _tos_save(st)
+
+        finally:
+            await browser.close()
+            save_sent(sent)
+
+    log(f"=== SEA-MAN DONE: новых {stats['new']}, дублей {stats['duplicate']}, не морские/мусор {stats['skipped']}, "
+        f"нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
+
+
 SCHEDULE = [tuple(int(x) for x in t.strip().split(":")) for t in os.getenv("SCHEDULE", "10:00,12:00,14:00,16:00").split(",") if t.strip()]
 
 
@@ -725,11 +1176,19 @@ async def run_all(sent):
         await scan_atlas(sent)
     except Exception as e:
         log(f"🔥 ATLAS ERROR: {type(e).__name__}: {e}")
+    try:
+        await scan_tos(sent)
+    except Exception as e:
+        log(f"🔥 TOS ERROR: {type(e).__name__}: {e}")
+    try:
+        await scan_seaman(sent)
+    except Exception as e:
+        log(f"🔥 SEA-MAN ERROR: {type(e).__name__}: {e}")
 
 
 async def main():
 
-    log("=== CREWELL + ATLAS VACANCIES PARSER STARTED ===")
+    log("=== CREWELL + ATLAS + TOS + SEA-MAN VACANCIES PARSER STARTED ===")
     log(f"Сайт: {bool(SITE_IMPORT_URL and SITE_IMPORT_TOKEN)}  SITE_ONLY={SITE_ONLY}  только за сегодня  страниц ≤ {MAX_PAGES}")
     log("Расписание (Лондон): " + ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE))
 
