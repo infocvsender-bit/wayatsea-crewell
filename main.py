@@ -513,6 +513,43 @@ ATLAS_CATEGORY = f"{ATLAS_BASE}/jobs/job-category/offshore-marine/"
 
 MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december"
 
+# Разовая выгрузка Atlas при первом запуске: все вакансии Offshore Marine с посадкой ПОСЛЕ этой даты (ATLAS_BACKFILL_FROM=0 — выключить)
+ATLAS_BACKFILL_FROM = os.getenv("ATLAS_BACKFILL_FROM", "07.10.2026").strip()
+if ATLAS_BACKFILL_FROM in ("0", "no", "false"):
+    ATLAS_BACKFILL_FROM = ""
+try:
+    _d, _m, _y = (int(x) for x in ATLAS_BACKFILL_FROM.split("."))
+    ATLAS_BACKFILL_DATE = date(_y, _m, _d)
+except Exception:
+    ATLAS_BACKFILL_DATE, ATLAS_BACKFILL_FROM = None, ""
+
+
+def parse_start(text):
+    """«October 13th, 2026» / «13.10.2026» / «13 October 2026» → date или None."""
+    t = (text or "").strip()
+    m = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", t)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
+    months = MONTHS.split("|")
+    m = re.search(rf"({MONTHS})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})", t, re.I) or None
+    if m:
+        try:
+            return date(int(m.group(3)), months.index(m.group(1).lower()) + 1, int(m.group(2)))
+        except ValueError:
+            return None
+    m = re.search(rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({MONTHS}),?\s+(\d{{4}})", t, re.I)
+    if m:
+        try:
+            return date(int(m.group(3)), months.index(m.group(2).lower()) + 1, int(m.group(1)))
+        except ValueError:
+            return None
+    if re.search(r"asap|immediate|urgent", t, re.I):
+        return date.today()
+    return None
+
 
 def atlas_today_urls(xml):
     """URL вакансий с lastmod = сегодня (по Лондону)."""
@@ -618,6 +655,7 @@ async def scan_atlas(sent):
     log("")
     log(f"=== ATLAS NEXTWAVE SCAN {london_now().strftime('%Y-%m-%d %H:%M')} ===")
     stats = {"new": 0, "duplicate": 0, "skipped": 0, "not_marine": 0, "no_email": 0, "error": 0}
+    backfill = False
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
@@ -644,6 +682,26 @@ async def scan_atlas(sent):
                     log(f"⚠️ Atlas: раздел Offshore Marine, стр. {n}: {type(e).__name__}")
 
             log(f"🗺 Atlas: сегодня в карте сайта {len(urls)}, в разделе Offshore Marine на 1–2 стр. {len(marine)}")
+
+            # разовая выгрузка: ВСЕ вакансии раздела Offshore Marine с посадкой после ATLAS_BACKFILL_FROM
+            st = _tos_state()
+            backfill = ATLAS_BACKFILL_FROM and not st.get("atlas_backfill_done")
+            if backfill:
+                allj = []
+                for n in range(1, 21):
+                    try:
+                        await page.goto(ATLAS_CATEGORY + (f"page/{n}/" if n > 1 else ""), wait_until="domcontentloaded", timeout=60000)
+                        hrefs = await page.locator("a[href*='/job/']").evaluate_all("els => els.map(e => e.href)")
+                    except Exception:
+                        break
+                    got = [h.split("?")[0].split("#")[0].rstrip("/") + "/" for h in hrefs if "/job/" in h]
+                    new_ = [h for h in dict.fromkeys(got) if h not in allj]
+                    if not new_:
+                        break
+                    allj += new_
+                    marine.update(new_)
+                log(f"📦 Atlas: разовая выгрузка — в разделе Offshore Marine {len(allj)} вакансий, беру с посадкой после {ATLAS_BACKFILL_FROM}")
+                urls = list(dict.fromkeys(urls + allj))
 
             for url in urls:
                 vid = "atlas:" + url.rstrip("/").rsplit("/", 1)[-1]
@@ -683,6 +741,13 @@ async def scan_atlas(sent):
                     sent.add(vid)
                     continue
 
+                if backfill:
+                    jd = parse_start(job["join"])
+                    if not jd or jd <= ATLAS_BACKFILL_DATE:
+                        sent.add(vid)
+                        log(f"⏭ Atlas {job['id']}: посадка {job['join'] or 'не указана'} — не после {ATLAS_BACKFILL_FROM}")
+                        continue
+
                 site = await send_to_site(job)
                 if site is False:
                     stats["error"] += 1
@@ -700,6 +765,10 @@ async def scan_atlas(sent):
             await browser.close()
             save_sent(sent)
 
+    if backfill and stats["error"] == 0:
+        st = _tos_state()
+        st["atlas_backfill_done"] = True
+        _tos_save(st)
     log(f"=== ATLAS DONE: новых {stats['new']}, дублей {stats['duplicate']}, не морские/мусор {stats['skipped']}, "
         f"не Offshore Marine {stats['not_marine']}, нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
 
@@ -708,7 +777,7 @@ async def scan_atlas(sent):
 # TOS PEOPLE (jobs.tospeople.com) — robots.txt разрешает всё
 #  • Даты публикации на сайте нет. Номера вакансий растут (10659, 10658…),
 #    поэтому «новые» = номер больше запомненного. При самом первом запуске
-#    парсер берёт последние 15 (TOS_FIRST_TAKE) и запоминает номер; дальше — только то, что появится после.
+#    парсер запоминает последний номер (TOS_FIRST_TAKE=15 — взять ещё и 15 последних); дальше — только новые.
 #    (TOS_START_ID=10650 — взять всё, что новее этого номера.)
 #  • Только морские разделы: Maritime, Offshore, Towage, Dredging, Ship Delivery.
 #  • Имейл консультанта — со страницы вакансии (…@tospeople.com).
@@ -717,7 +786,7 @@ async def scan_atlas(sent):
 TOS = os.getenv("TOS", "1").lower() not in ("0", "false", "no")
 TOS_BASE = "https://jobs.tospeople.com"
 TOS_STATE = Path(os.getenv("TOS_STATE_FILE", "tos_state.json"))
-TOS_FIRST_TAKE = int(os.getenv("TOS_FIRST_TAKE", "15") or 15)   # сколько последних взять при первом запуске
+TOS_FIRST_TAKE = int(os.getenv("TOS_FIRST_TAKE", "0") or 0)   # сколько последних взять при первом запуске
 TOS_MARINE = re.compile(r"\b(maritime|offshore|towage|dredging|ship delivery)\b", re.I)
 TOS_LAND = re.compile(r"\b(onshore|port\s*&\s*logistics|logistics)\b", re.I)
 
@@ -879,7 +948,7 @@ async def scan_tos(sent):
             got, nxt = await grab_list(f"{TOS_BASE}/en?lang=eng")
             # вторая–третья страницы (нужно на первом запуске, чтобы набрать 15 последних)
             for extra in [nxt, f"{TOS_BASE}/en?lang=eng&page=2", f"{TOS_BASE}/en?page=2&lang=eng"]:
-                if len(ids) >= TOS_FIRST_TAKE or not extra:
+                if len(ids) >= max(TOS_FIRST_TAKE, 1) or not extra:
                     break
                 try:
                     g, _ = await grab_list(extra)
@@ -895,6 +964,11 @@ async def scan_tos(sent):
             last = st.get("last_id") or int(os.getenv("TOS_START_ID", "0") or 0)
             if not last:
                 # первый запуск: берём последние TOS_FIRST_TAKE (по умолчанию 15) и дальше — только новее
+                if TOS_FIRST_TAKE <= 0:
+                    st["last_id"] = max(ids)
+                    _tos_save(st)
+                    log(f"📌 TOS: первый запуск — запомнил последний номер {max(ids)}, дальше беру только новые")
+                    return
                 newest = sorted(ids, reverse=True)[:TOS_FIRST_TAKE]
                 last = min(newest) - 1
                 log(f"📌 TOS: первый запуск — беру последние {len(newest)} вакансий (номера {min(newest)}–{max(newest)}) и запоминаю")
@@ -972,7 +1046,7 @@ async def scan_tos(sent):
 
 SEAMAN = os.getenv("SEAMAN", "1").lower() not in ("0", "false", "no")
 SEAMAN_BASE = "https://crew.sea-man.org"
-SEAMAN_FIRST_TAKE = int(os.getenv("SEAMAN_FIRST_TAKE", "15") or 15)
+SEAMAN_FIRST_TAKE = int(os.getenv("SEAMAN_FIRST_TAKE", "0") or 0)
 
 SEAMAN_JS = r"""() => {
     const h = document.querySelector('h1');
@@ -1079,6 +1153,11 @@ async def scan_seaman(sent):
                 return
 
             if not last:
+                if SEAMAN_FIRST_TAKE <= 0:
+                    st["seaman_last"] = max(ids)
+                    _tos_save(st)
+                    log(f"📌 Sea-man: первый запуск — запомнил последний номер {max(ids)}, дальше беру только новые")
+                    return
                 newest = sorted(ids, reverse=True)[:SEAMAN_FIRST_TAKE]
                 last = min(newest) - 1
                 log(f"📌 Sea-man: первый запуск — беру последние {len(newest)} (номера {min(newest)}–{max(newest)}) и запоминаю")
