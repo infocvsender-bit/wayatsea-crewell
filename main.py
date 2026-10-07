@@ -225,13 +225,14 @@ LIST_JS = r"""() => {
         const m = (a.href || '').match(/\/vacancies\/(\d+)\/?(?:[?#].*)?$/);
         if (!m || seen.has(m[1])) continue;
         // карточка: ближайший родитель, где есть ссылка на компанию и только одна вакансия
+        // карточка: САМЫЙ БОЛЬШОЙ родитель, где ещё только одна вакансия (там и «4h 52min ago» внизу карточки)
         let el = a, card = null;
-        for (let i = 0; el && i < 10; i++) {
+        for (let i = 0; el && i < 14; i++) {
             el = el.parentElement;
-            if (!el) break;
+            if (!el || el.tagName === 'BODY') break;
             const vac = new Set([...el.querySelectorAll('a[href*="/vacancies/"]')].map(x => (x.href.match(/\/vacancies\/(\d+)/) || [])[1]).filter(Boolean));
             if (vac.size > 1) break;
-            if (el.querySelector('a[href*="/companies/"]')) { card = el; break; }
+            if (el.querySelector('a[href*="/companies/"]')) card = el;
         }
         if (!card) continue;
         seen.add(m[1]);
@@ -384,6 +385,14 @@ async def scan(sent):
 
                     # только опубликованные СЕГОДНЯ (по Лондону)
                     today = is_today(c["text"])
+                    if today is None and c["id"] not in sent:
+                        # на карточке времени нет — смотрим на странице вакансии
+                        try:
+                            await vpage.goto(f"{BASE}/en/vacancies/{c['id']}/", wait_until="domcontentloaded", timeout=60000)
+                            await vpage.wait_for_timeout(600)
+                            today = is_today(await vpage.evaluate("() => document.body.innerText"))
+                        except Exception:
+                            pass
                     if today is None:
                         stats["unknown"] += 1
                         if stats["unknown"] <= 3:
