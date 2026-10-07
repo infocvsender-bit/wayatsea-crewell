@@ -7,6 +7,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #  • Контакт (e-mail) берём из НАШЕГО каталога компаний: компания crewell
 #    с тем же номером, что в ссылке /companies/ID/.
 #  • У компании нет e-mail → вакансию не собираем и не публикуем.
+#  • Берём ТОЛЬКО вакансии, опубликованные сегодня (по Лондону).
 #  • Сначала сайт (он решает: новая / дубль / мусор), новые — в бот.
 #    Своего Telegram у этого парсера нет: сообщение кладём в очередь на сайте,
 #    его забирает и отправляет в бот Telegram-парсер.
@@ -15,7 +16,6 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #   SITE_IMPORT_URL    https://www.wayatsea.com/api/import/vacancies
 #   SITE_IMPORT_TOKEN  тот же ключ, что IMPORT_TOKEN на сайте
 #   SITE_ONLY=1        (необязательно) только сайт, без бота
-#   MAX_AGE_DAYS=2     (необязательно) брать вакансии не старше N дней
 #   MAX_PAGES=40       (необязательно) сколько страниц списка смотреть максимум
 #   SCAN_EVERY_MIN=60  (необязательно) как часто проверять
 # ============================================================
@@ -36,7 +36,6 @@ BASE = "https://crewell.net"
 SITE_IMPORT_URL = os.getenv("SITE_IMPORT_URL")
 SITE_IMPORT_TOKEN = os.getenv("SITE_IMPORT_TOKEN")
 SITE_ONLY = os.getenv("SITE_ONLY", "").lower() in ("1", "true", "yes")
-MAX_AGE_DAYS = int(os.getenv("MAX_AGE_DAYS", "2") or 2)
 MAX_PAGES = int(os.getenv("MAX_PAGES", "40") or 40)
 SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "60") or 60)
 WORK_HOURS = (7, 21)   # по Лондону: ночью не сканируем
@@ -151,23 +150,41 @@ async def to_bot(text):
 # РАЗБОР CREWELL
 # ------------------------------------------------------------
 
-def age_days(text):
-    """«4h 52min ago» → 0, «2d 3h ago» / «2 days ago» → 2, «12.10.2026» → по дате; None — не поняли."""
+def posted_at(text, now=None):
+    """Когда опубликована: «4h 52min ago», «1d 3h ago», «2 days ago», «just now», «вчера», «07.10.2026» → datetime (Лондон) или None."""
+    now = now or london_now()
     t = (text or "").lower()
-    m = re.search(r"(\d+)\s*(d|day|days|дн|день|дня|дней)\b", t)
+    m = re.search(r"((?:\d+\s*(?:d|day|days|h|hr|hrs|hour|hours|min|mins|minute|minutes|m|s|sec|дн|день|дня|дней|ч|час|часа|часов|мин|минут|сек)\.?\s*)+)(?:ago|назад)", t)
     if m:
-        return int(m.group(1))
-    if re.search(r"\d+\s*(h|min|m|s|ч|мин|сек)\b|hour|minute|только что|just now|today|сегодня", t):
-        return 0
+        delta = timedelta()
+        for num, unit in re.findall(r"(\d+)\s*([a-zа-я]+)", m.group(1)):
+            n = int(num)
+            if unit.startswith(("d", "дн", "ден", "дня", "дне")):
+                delta += timedelta(days=n)
+            elif unit.startswith(("h", "ч")):
+                delta += timedelta(hours=n)
+            elif unit.startswith(("min", "мин")) or unit == "m":
+                delta += timedelta(minutes=n)
+        return now - delta
+    if re.search(r"just now|только что|сейчас", t):
+        return now
     if re.search(r"yesterday|вчера", t):
-        return 1
-    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})", t)
-    if m:
+        return now - timedelta(days=1)
+    m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?", t)
+    if m and re.search(r"(publish|posted|опублик|added|добавлен|created)", t):
         try:
-            return (date.today() - date(int(m.group(3)), int(m.group(2)), int(m.group(1)))).days
+            return now.replace(year=int(m.group(3)), month=int(m.group(2)), day=int(m.group(1)), hour=int(m.group(4) or 0), minute=int(m.group(5) or 0))
         except ValueError:
             return None
     return None
+
+
+def is_today(text):
+    """True — опубликована сегодня (по Лондону), False — раньше, None — не удалось понять."""
+    p = posted_at(text)
+    if p is None:
+        return None
+    return p.date() == london_now().date()
 
 
 LIST_JS = r"""() => {
@@ -305,7 +322,7 @@ async def scan(sent):
         return
     log(f"📇 Компаний crewell с e-mail в нашем каталоге: {len(contacts)}")
 
-    stats = {"new": 0, "duplicate": 0, "skipped": 0, "no_email": 0, "old": 0, "error": 0}
+    stats = {"new": 0, "duplicate": 0, "skipped": 0, "no_email": 0, "old": 0, "unknown": 0, "error": 0}
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
@@ -332,8 +349,14 @@ async def scan(sent):
                 fresh = 0
                 for c in cards:
 
-                    age = age_days(c["text"])
-                    if age is not None and age > MAX_AGE_DAYS:
+                    # только опубликованные СЕГОДНЯ (по Лондону)
+                    today = is_today(c["text"])
+                    if today is None:
+                        stats["unknown"] += 1
+                        if stats["unknown"] <= 3:
+                            log(f"❓ {c['id']}: не понял время публикации — пропуск. Текст карточки: {c['text'][-160:]!r}")
+                        continue
+                    if not today:
                         stats["old"] += 1
                         continue
                     fresh += 1
@@ -396,20 +419,20 @@ async def scan(sent):
                 log(f"📄 Стр. {n}: карточек {len(cards)}, свежих {fresh}")
 
                 if fresh == 0:
-                    break      # дальше только старые
+                    break      # на странице нет сегодняшних — дальше только старее
 
         finally:
             await browser.close()
 
     log(f"=== CREWELL DONE: новых {stats['new']}, дублей {stats['duplicate']}, мусор {stats['skipped']}, "
-        f"нет e-mail {stats['no_email']}, старых {stats['old']}, ошибок {stats['error']} ===")
+        f"нет e-mail {stats['no_email']}, не сегодня {stats['old']}, время не понял {stats['unknown']}, ошибок {stats['error']} ===")
 
 
 async def main():
 
     log("=== CREWELL VACANCIES PARSER STARTED ===")
     log(f"Сайт: {bool(SITE_IMPORT_URL and SITE_IMPORT_TOKEN)}  SITE_ONLY={SITE_ONLY}  "
-        f"свежесть ≤ {MAX_AGE_DAYS} дн.  страниц ≤ {MAX_PAGES}  каждые {SCAN_EVERY_MIN} мин")
+        f"только за сегодня  страниц ≤ {MAX_PAGES}  каждые {SCAN_EVERY_MIN} мин")
 
     sent = load_sent()
     log(f"💾 В памяти: {len(sent)} вакансий")
