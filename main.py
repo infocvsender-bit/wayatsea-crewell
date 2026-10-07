@@ -17,7 +17,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #   SITE_IMPORT_TOKEN  тот же ключ, что IMPORT_TOKEN на сайте
 #   SITE_ONLY=1        (необязательно) только сайт, без бота
 #   MAX_PAGES=40       (необязательно) сколько страниц списка смотреть максимум
-#   SCAN_EVERY_MIN=60  (необязательно) как часто проверять
+#   SCHEDULE=10:00,12:00,14:00,16:00  (необязательно) когда проверять, по Лондону
 # ============================================================
 
 import asyncio
@@ -122,7 +122,7 @@ async def send_to_site(job):
             log(f"❌ Сайт отклонил {job['id']}: {res.get('error')} {res.get('detail') or ''}")
             return False
         if res.get("skipped"):
-            log(f"🗑 {job['id']}: сайт отклонил как мусор ({res.get('reason')})")
+            log(f"🗑 {job['id']}: сайт отклонил как мусор ({res.get('reason')}) — должность «{job.get('rank')}»")
             return "skipped"
         if res.get("duplicate"):
             log(f"♻️ {job['id']}: дубль ({res.get('reason')})")
@@ -357,6 +357,8 @@ async def scan(sent):
     log(f"📇 Компаний crewell с e-mail в нашем каталоге: {len(contacts)}")
 
     stats = {"new": 0, "duplicate": 0, "skipped": 0, "no_email": 0, "old": 0, "unknown": 0, "error": 0}
+    bad_pages = 0
+    stop = False
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
@@ -413,6 +415,12 @@ async def scan(sent):
                         log(f"⛔ {vid}: у компании «{c['company'] or c['company_id']}» нет e-mail в каталоге — пропуск")
                         continue
 
+                    # 1) основное — из карточки списка (должность, судно, зарплата, дата, длительность)
+                    card_title = next((x.strip() for x in c["text"].splitlines() if re.search(r"\S\s+(on|на)\s+\S", x) and len(x.strip()) < 120), "")
+                    job = parse_vacancy(c["text"], card_title)
+                    card_ok = bool(card_title and job["rank"])
+
+                    # 2) подробности — со страницы вакансии, ТОЛЬКО если открылась настоящая страница этой вакансии
                     vurl = f"{BASE}/en/vacancies/{vid}/"
                     try:
                         await vpage.goto(vurl, wait_until="domcontentloaded", timeout=60000)
@@ -421,12 +429,27 @@ async def scan(sent):
                         if await vpage.locator("h1").count():
                             title = (await vpage.locator("h1").first.inner_text()).strip()
                         text = await vpage.evaluate("() => document.body.innerText")
+                        page_ok = bool(re.search(r"\s(on|на)\s", title)) and (vid in text or (card_title and title.lower() == card_title.lower()))
                     except Exception as e:
-                        stats["error"] += 1
-                        log(f"❌ {vid}: {type(e).__name__}: {e}")
-                        continue
+                        page_ok, title, text = False, "", ""
+                        log(f"⚠️ {vid}: страница вакансии не открылась ({type(e).__name__})")
 
-                    job = parse_vacancy(text, title)
+                    if page_ok:
+                        pj = parse_vacancy(text, title)
+                        for k, v in pj.items():
+                            if v and (k == "info" or not job.get(k)):
+                                job[k] = v
+                    else:
+                        bad_pages += 1
+                        log(f"⚠️ {vid}: вместо вакансии открылось «{(title or text[:60]).strip()[:60]}» — беру данные из карточки")
+                        if not card_ok:
+                            stats["error"] += 1
+                            continue          # не запоминаем — повторим в следующий раз
+                        if bad_pages >= 5:
+                            log("🛑 crewell не отдаёт страницы вакансий (защита от частых запросов?) — пауза до следующей проверки")
+                            stop = True
+                            break
+
                     job.update({"id": vid, "url": f"{BASE}/ru/vacancies/{vid}/", "email": contact["email"],
                                 "company": c["company"] or contact.get("name") or ""})
 
@@ -456,9 +479,12 @@ async def scan(sent):
                     if site == "new" and not SITE_ONLY:
                         await to_bot(make_message(job))
 
-                    await asyncio.sleep(1.5)   # бережно к сайту
+                    await asyncio.sleep(3)   # бережно к сайту
 
                 log(f"📄 Стр. {n}: карточек {len(cards)}, свежих {fresh}")
+
+                if stop:
+                    break
 
                 if fresh == 0:
                     break      # на странице нет сегодняшних — дальше только старее
@@ -676,32 +702,53 @@ async def scan_atlas(sent):
         f"не Offshore Marine {stats['not_marine']}, нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
 
 
+SCHEDULE = [tuple(int(x) for x in t.strip().split(":")) for t in os.getenv("SCHEDULE", "10:00,12:00,14:00,16:00").split(",") if t.strip()]
+
+
+def next_run(now):
+    for h, m in SCHEDULE:
+        t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if t > now:
+            return t
+    h, m = SCHEDULE[0]
+    return (now + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+
+
+async def run_all(sent):
+    if not SITE_ONLY:
+        await flush_bot_pending()
+    try:
+        await scan(sent)
+    except Exception as e:
+        log(f"🔥 SCAN ERROR: {type(e).__name__}: {e}")
+    try:
+        await scan_atlas(sent)
+    except Exception as e:
+        log(f"🔥 ATLAS ERROR: {type(e).__name__}: {e}")
+
+
 async def main():
 
-    log("=== CREWELL VACANCIES PARSER STARTED ===")
-    log(f"Сайт: {bool(SITE_IMPORT_URL and SITE_IMPORT_TOKEN)}  SITE_ONLY={SITE_ONLY}  "
-        f"только за сегодня  страниц ≤ {MAX_PAGES}  каждые {SCAN_EVERY_MIN} мин")
+    log("=== CREWELL + ATLAS VACANCIES PARSER STARTED ===")
+    log(f"Сайт: {bool(SITE_IMPORT_URL and SITE_IMPORT_TOKEN)}  SITE_ONLY={SITE_ONLY}  только за сегодня  страниц ≤ {MAX_PAGES}")
+    log("Расписание (Лондон): " + ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE))
 
     sent = load_sent()
     log(f"💾 В памяти: {len(sent)} вакансий")
 
+    # при запуске — сразу одна проверка, если сейчас рабочее время (между первым и последним запуском + 1 час)
+    now = london_now()
+    first, last = SCHEDULE[0], SCHEDULE[-1]
+    if (now.hour, now.minute) >= first and now.hour <= last[0]:
+        log("🚀 Запуск в рабочее время — проверяю сразу")
+        await run_all(sent)
+
     while True:
-        h = london_now().hour
-        if WORK_HOURS[0] <= h < WORK_HOURS[1]:
-            if not SITE_ONLY:
-                await flush_bot_pending()
-            try:
-                await scan(sent)
-            except Exception as e:
-                log(f"🔥 SCAN ERROR: {type(e).__name__}: {e}")
-            try:
-                await scan_atlas(sent)
-            except Exception as e:
-                log(f"🔥 ATLAS ERROR: {type(e).__name__}: {e}")
-        else:
-            log(f"🌙 Ночь по Лондону ({h}:00) — пропуск")
-        log(f"⏳ Следующая проверка через {SCAN_EVERY_MIN} мин")
-        await asyncio.sleep(SCAN_EVERY_MIN * 60)
+        now = london_now()
+        target = next_run(now)
+        log(f"⏳ Следующая проверка: {target.strftime('%d.%m %H:%M')} (через {int((target - now).total_seconds() // 60)} мин)")
+        await asyncio.sleep(max(30, (target - now).total_seconds()))
+        await run_all(sent)
 
 
 if __name__ == "__main__":
