@@ -136,15 +136,45 @@ async def send_to_site(job):
     return False
 
 
-async def to_bot(text, source="crewell"):
-    """В бот через очередь на сайте (её отправляет Telegram-парсер)."""
+BOT_PENDING = Path(os.getenv("BOT_PENDING_FILE", "bot_pending.json"))
+
+
+def _pending_load():
+    try:
+        return json.loads(BOT_PENDING.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _pending_save(items):
+    try:
+        BOT_PENDING.write_text(json.dumps(items[-500:], ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def to_bot(text, source="crewell", queue_on_fail=True):
+    """В бот через очередь на сайте (её отправляет Telegram-парсер). Не вышло — держим у себя и дошлём позже."""
     try:
         await asyncio.to_thread(_site, "/api/import/bot-outbox", {"text": text, "source": source})
         log("📨 В очередь бота")
         return True
     except Exception as e:
-        log(f"⚠️ Очередь бота недоступна: {type(e).__name__}: {e}")
+        log(f"⚠️ Очередь бота на сайте недоступна ({type(e).__name__}: {e}) — дошлю при следующей проверке")
+        if queue_on_fail:
+            items = _pending_load()
+            items.append({"text": text, "source": source})
+            _pending_save(items)
         return False
+
+
+async def flush_bot_pending():
+    items = _pending_load()
+    if not items:
+        return
+    left = [it for it in items if not await to_bot(it["text"], it.get("source", "crewell"), queue_on_fail=False)]
+    _pending_save(left)
+    log(f"📤 Дослано в очередь бота: {len(items) - len(left)}, осталось {len(left)}")
 
 
 # ------------------------------------------------------------
@@ -649,6 +679,8 @@ async def main():
     while True:
         h = london_now().hour
         if WORK_HOURS[0] <= h < WORK_HOURS[1]:
+            if not SITE_ONLY:
+                await flush_bot_pending()
             try:
                 await scan(sent)
             except Exception as e:
