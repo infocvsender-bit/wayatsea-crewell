@@ -100,8 +100,9 @@ async def load_contacts():
 async def send_to_site(job):
     """"new" / "duplicate" / "skipped" / False (сайт не ответил)."""
     payload = {
-        "source": "crewell",
+        "source": job.get("source", "crewell"),
         "external_id": job["id"],
+        "region": job.get("region", ""),
         "url": job["url"],
         "title": job["rank"],
         "rank": job["rank"],
@@ -135,10 +136,10 @@ async def send_to_site(job):
     return False
 
 
-async def to_bot(text):
+async def to_bot(text, source="crewell"):
     """В бот через очередь на сайте (её отправляет Telegram-парсер)."""
     try:
-        await asyncio.to_thread(_site, "/api/import/bot-outbox", {"text": text, "source": "crewell"})
+        await asyncio.to_thread(_site, "/api/import/bot-outbox", {"text": text, "source": source})
         log("📨 В очередь бота")
         return True
     except Exception as e:
@@ -269,6 +270,8 @@ def make_message(job):
     lines = [f"⚓ Rank: {job['rank']}"]
     if job["vessel_type"]:
         lines.append(f"🚢 Vessel type: {job['vessel_type']}")
+    if job.get("region"):
+        lines.append(f"🌍 Region: {job['region']}")
     if job["join"]:
         lines.append(f"📅 Date: {job['join']}")
     if job["duration"]:
@@ -428,6 +431,212 @@ async def scan(sent):
         f"нет e-mail {stats['no_email']}, не сегодня {stats['old']}, время не понял {stats['unknown']}, ошибок {stats['error']} ===")
 
 
+# ============================================================
+# ATLAS NEXTWAVE (atlasnextwave.com) — раздел Offshore Marine
+#  • robots.txt запрещает только поиск (?s=) и фильтры (?f_), поэтому
+#    список берём из карты сайта job-sitemap.xml (дата lastmod) и
+#    из раздела /jobs/job-category/offshore-marine/ — оба разрешены.
+#  • Только сегодняшние (lastmod = сегодня по Лондону), только Offshore Marine,
+#    только с e-mail консультанта на странице. Морскую должность проверяет сайт.
+# ============================================================
+
+ATLAS = os.getenv("ATLAS", "1").lower() not in ("0", "false", "no")
+ATLAS_BASE = "https://atlasnextwave.com"
+ATLAS_CATEGORY = f"{ATLAS_BASE}/jobs/job-category/offshore-marine/"
+
+MONTHS = "january|february|march|april|may|june|july|august|september|october|november|december"
+
+
+def atlas_today_urls(xml):
+    """URL вакансий с lastmod = сегодня (по Лондону)."""
+    today = london_now().date()
+    out = []
+    for loc, lastmod in re.findall(r"<loc>\s*([^<]+?)\s*</loc>\s*(?:<lastmod>\s*([^<]+?)\s*</lastmod>)?", xml or ""):
+        if "/job/" not in loc or not lastmod:
+            continue
+        try:
+            dt = datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
+            try:
+                from zoneinfo import ZoneInfo
+                dt = dt.astimezone(ZoneInfo("Europe/London"))
+            except Exception:
+                pass
+        except ValueError:
+            continue
+        if dt.date() == today:
+            out.append(loc.strip())
+    return out
+
+
+ATLAS_JS = r"""() => {
+    const h = document.querySelector('h1');
+    const body = document.body.innerText || '';
+    const title = h ? h.innerText.trim() : '';
+    // текст вакансии: от заголовка до формы отклика
+    let t = title ? body.slice(Math.max(0, body.indexOf(title))) : body;
+    const cut = t.search(/\n\s*(apply for this job|apply now|first name\b|submit application|similar jobs|related jobs)/i);
+    if (cut > 0) t = t.slice(0, cut);
+    const crumbs = [...document.querySelectorAll('a[href*="/job-category/"]')].map(a => a.href + ' ' + a.innerText).join(' | ');
+    const mails = [...document.querySelectorAll('a[href^="mailto:"]')].map(a => a.href.replace(/^mailto:/i, '').split('?')[0]);
+    return {title, text: t.slice(0, 6000), full: body.slice(0, 20000), crumbs, mails};
+}"""
+
+
+def atlas_parse(d, url):
+    title = (d.get("title") or "").strip()
+    lines = [re.sub(r"\s*\t+\s*", ": ", x).strip() for x in (d.get("text") or "").splitlines() if x.strip()]
+
+    emails = [e.lower() for e in re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", (d.get("full") or "") + " " + " ".join(d.get("mails") or []))]
+    emails = [e for e in dict.fromkeys(emails) if not re.match(r"^(no-?reply|privacy|gdpr|dpo|wordpress)@", e) and not e.endswith((".png", ".jpg"))]
+    # консультант (имя@atlasnextwave.com) важнее общих адресов
+    generic = re.compile(r"^(info|contact|hello|admin|office|careers|jobs|recruitment)@")
+    email = next((e for e in emails if "atlasnextwave" in e and not generic.match(e)), None) or next(iter(emails), "")
+
+    text = "\n".join(lines)
+    start = field(lines, "start date", "start", "date", "mobilisation", "mobilization")
+    if not start:
+        m = re.search(rf"\b(?:{MONTHS})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}", text, re.I)
+        start = m.group(0) if m else ""
+    region = field(lines, "location", "country", "region")
+    if not region and start:
+        # строка вида «Angola  Contract  October 13th, 2026»
+        for x in lines[:12]:
+            if start in x:
+                rest = re.sub(r"\b(contract|permanent|temporary|freelance|full[- ]time|part[- ]time|rotational)\b", " ", x.replace(start, " "), flags=re.I)
+                rest = re.sub(r"[|•·,]+", " ", rest).strip()
+                if 2 <= len(rest) <= 40:
+                    region = re.sub(r"\s{2,}", " ", rest)
+                break
+    duration = field(lines, "duration", "rotation", "schedule", "length")
+    if not duration:
+        m = re.search(r"\d+\s*(?:weeks?|days?)\s*on\s*/\s*\d+\s*(?:weeks?|days?)\s*off", text, re.I)
+        duration = m.group(0) if m else ""
+    salary = field(lines, "salary", "day rate", "rate", "pay")
+    vessel = ""
+    m = re.search(r"\b(?:on|onboard|aboard|join|joining)\s+(?:an?\s+|the\s+|our\s+)?([A-Za-z /&-]{3,60}?(?:vessel|ship|tanker|carrier|barge|rig|jack-?up|fpso|psv|ahts|csv|dsv|osv|dredger|tug))\b", text, re.I)
+    if m:
+        vessel = m.group(1).strip()
+
+    # описание (без шапки и строк с полями)
+    drop = set()
+    for i, x in enumerate(lines):
+        if x.lower() in ("consultant", "recruitment consultant", "senior consultant") and i:
+            drop.update({i - 1, i})
+    desc = [x for i, x in enumerate(lines[1:], 1)
+            if i not in drop and (not start or start not in x) and "@" not in x
+            and not re.match(r"^(location|country|job type|type|start date|category|duration|salary|share|apply|job description|description)\b", x, re.I)]
+    info = "\n".join(desc)[:2500]
+
+    return {
+        "source": "atlas",
+        "id": url.rstrip("/").rsplit("/", 1)[-1],
+        "url": url,
+        "rank": title[:120],
+        "vessel_type": vessel[:100],
+        "region": region[:120],
+        "join": start[:100],
+        "duration": duration[:100],
+        "salary": salary[:100],
+        "email": email,
+        "company": "Atlas NextWave",
+        "info": info,
+    }
+
+
+async def scan_atlas(sent):
+
+    if not ATLAS:
+        return
+
+    log("")
+    log(f"=== ATLAS NEXTWAVE SCAN {london_now().strftime('%Y-%m-%d %H:%M')} ===")
+    stats = {"new": 0, "duplicate": 0, "skipped": 0, "not_marine": 0, "no_email": 0, "error": 0}
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-setuid-sandbox"])
+        ctx = await browser.new_context(user_agent=USER_AGENT, locale="en-GB")
+        page = await ctx.new_page()
+
+        try:
+            # 1) сегодняшние вакансии из карты сайта
+            urls = []
+            try:
+                r = await page.goto(f"{ATLAS_BASE}/job-sitemap.xml", wait_until="domcontentloaded", timeout=60000)
+                urls = atlas_today_urls(await r.text() if r else "")
+            except Exception as e:
+                log(f"⚠️ Atlas: карта сайта недоступна: {type(e).__name__}: {e}")
+
+            # 2) из раздела Offshore Marine берём только те, что есть в «сегодняшних» (раздел — для отбора категории)
+            marine = set()
+            for n in (1, 2):
+                try:
+                    await page.goto(ATLAS_CATEGORY + (f"page/{n}/" if n > 1 else ""), wait_until="domcontentloaded", timeout=60000)
+                    hrefs = await page.locator("a[href*='/job/']").evaluate_all("els => els.map(e => e.href)")
+                    marine.update(h.split("?")[0].split("#")[0].rstrip("/") + "/" for h in hrefs)
+                except Exception as e:
+                    log(f"⚠️ Atlas: раздел Offshore Marine, стр. {n}: {type(e).__name__}")
+
+            log(f"🗺 Atlas: сегодня в карте сайта {len(urls)}, в разделе Offshore Marine на 1–2 стр. {len(marine)}")
+
+            for url in urls:
+                vid = "atlas:" + url.rstrip("/").rsplit("/", 1)[-1]
+                if vid in sent:
+                    continue
+                key = url.split("?")[0].rstrip("/") + "/"
+                if marine and key not in marine:
+                    # нет в разделе — проверим категорию на самой странице
+                    pass
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    await page.wait_for_timeout(700)
+                    d = await page.evaluate(ATLAS_JS)
+                except Exception as e:
+                    stats["error"] += 1
+                    log(f"❌ Atlas {url}: {type(e).__name__}")
+                    continue
+
+                if key not in marine and "offshore-marine" not in (d.get("crumbs") or "").lower():
+                    stats["not_marine"] += 1
+                    sent.add(vid)
+                    continue
+
+                job = atlas_parse(d, url)
+                job["id"] = vid.split(":", 1)[1]
+
+                if not job["email"]:
+                    stats["no_email"] += 1
+                    log(f"⛔ Atlas {job['id']}: нет e-mail — пропуск")
+                    sent.add(vid)
+                    continue
+
+                if stats["new"] + stats["duplicate"] + stats["skipped"] < 2:
+                    log("🔎 Atlas пример: " + json.dumps({k: v for k, v in job.items() if k != "info"}, ensure_ascii=False))
+
+                if join_expired(job["join"]):
+                    sent.add(vid)
+                    continue
+
+                site = await send_to_site(job)
+                if site is False:
+                    stats["error"] += 1
+                    continue
+                stats[site] += 1
+                sent.add(vid)
+                save_sent(sent)
+
+                if site == "new" and not SITE_ONLY:
+                    await to_bot(make_message(job), "atlas")
+
+                await asyncio.sleep(2)
+
+        finally:
+            await browser.close()
+            save_sent(sent)
+
+    log(f"=== ATLAS DONE: новых {stats['new']}, дублей {stats['duplicate']}, не морские/мусор {stats['skipped']}, "
+        f"не Offshore Marine {stats['not_marine']}, нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
+
+
 async def main():
 
     log("=== CREWELL VACANCIES PARSER STARTED ===")
@@ -444,6 +653,10 @@ async def main():
                 await scan(sent)
             except Exception as e:
                 log(f"🔥 SCAN ERROR: {type(e).__name__}: {e}")
+            try:
+                await scan_atlas(sent)
+            except Exception as e:
+                log(f"🔥 ATLAS ERROR: {type(e).__name__}: {e}")
         else:
             log(f"🌙 Ночь по Лондону ({h}:00) — пропуск")
         log(f"⏳ Следующая проверка через {SCAN_EVERY_MIN} мин")
