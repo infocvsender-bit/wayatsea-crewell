@@ -299,7 +299,38 @@ def parse_vacancy(text, title):
     return job
 
 
+# ------------------------------------------------------------
+# ПРОВЕРКА ПОЛЕЙ ПЕРЕД ОТПРАВКОЙ В БОТ
+# зарплата «up to 1 $» (меньше 100) → Negotiable; «English proficiency» и т.п. — не тип судна
+# ------------------------------------------------------------
+_VESSEL_WORD = re.compile(
+    r"\b(vessel|ship|boat|carrier|bulker|bulk|tanker|barge|ferry|tug|yacht|reefer|dredger|rig|jack[\s-]?up|drill\w*|platform|"
+    r"fpso|fso|psv|ahts|osv|mpsv|errv|dsv|sov|csov|ctv|lng|lpg|vlcc|ro[\s-]?ro|ro[\s-]?pax|pctc|pcc|cargo|container|cruise|"
+    r"passenger|offshore|supply|survey|research|cable|pipe\s*lay\w*|heavy\s+lift|crane|chemical|crude|product|gas)\b|"
+    r"судно|танкер|балкер|контейнеровоз|сухогруз|газовоз|буксир|паром|рефрижератор",
+    re.I,
+)
+
+
+def sane_vessel(value):
+    v = (value or "").strip()
+    return v if v and _VESSEL_WORD.search(v) else ""
+
+
+def sane_salary(value):
+    v = (value or "").strip()
+    if not v or not re.search(r"\d", v):
+        return v
+    if re.search(r"\d\s*k\b|\d\s*тыс", v, re.I):
+        return v
+    nums = [int(x) for x in re.findall(r"\d{3,6}", re.sub(r"(\d)[\s,.](?=\d{3}\b)", r"\1", v))]
+    return v if any(100 <= n < 200000 for n in nums) else "Negotiable"
+
+
 def make_message(job):
+    job = dict(job)
+    job["vessel_type"] = sane_vessel(job.get("vessel_type"))
+    job["salary"] = sane_salary(job.get("salary"))
     lines = [f"⚓ Rank: {job['rank']}"]
     if job["vessel_type"]:
         lines.append(f"🚢 Vessel type: {job['vessel_type']}")
@@ -797,7 +828,7 @@ TOS_RANKS = [
     (r"\b3/?e\b|third\s+engineer|3rd\s+engineer", "Third Engineer"), (r"\beto\b|electro.?technical", "ETO"),
     (r"\belectrician\b", "Electrician"), (r"\bdpo\b|dynamic\s+positioning", "DPO"), (r"\bbosun\b|boatswain", "Bosun"),
     (r"\bab\b|able\s+seaman", "AB"), (r"\bos\b|ordinary\s+seaman", "OS"), (r"\bdeckhand\b", "Deckhand"),
-    (r"\boiler\b", "Oiler"), (r"\bmotorman\b", "Motorman"), (r"\bfitter\b", "Fitter"), (r"\bcook\b", "Cook"),
+    (r"\boiler\b", "Oiler"), (r"\bmotorman\b", "Motorman"), (r"\bfitter\b", "Fitter"), (r"\bpainter\b", "Painter"), (r"\bwelder\b", "Welder"), (r"\bcook\b", "Cook"),
     (r"\bsteward\b|messman", "Steward"), (r"\bcrane\s+operator\b", "Crane Operator"),
 ]
 
