@@ -7,7 +7,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #  • Контакт (e-mail) берём из НАШЕГО каталога компаний: компания crewell
 #    с тем же номером, что в ссылке /companies/ID/.
 #  • У компании нет e-mail → вакансию не собираем и не публикуем.
-#  • Берём ТОЛЬКО вакансии, опубликованные сегодня (по Лондону).
+#  • Берём ТОЛЬКО вакансии, опубликованные сегодня (по Брюсселю).
 #  • Сначала сайт (он решает: новая / дубль / мусор), новые — в бот.
 #    Своего Telegram у этого парсера нет: сообщение кладём в очередь на сайте,
 #    его забирает и отправляет в бот Telegram-парсер.
@@ -17,7 +17,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #   SITE_IMPORT_TOKEN  тот же ключ, что IMPORT_TOKEN на сайте
 #   SITE_ONLY=1        (необязательно) только сайт, без бота
 #   MAX_PAGES=40       (необязательно) сколько страниц списка смотреть максимум
-#   SCHEDULE=10:00,12:00,14:00,16:00  (необязательно) когда проверять, по Лондону
+#   SCHEDULE=09:00,11:00,13:00,15:00,17:00  (необязательно) когда проверять, по Брюсселю
 # ============================================================
 
 import asyncio
@@ -38,7 +38,7 @@ SITE_IMPORT_TOKEN = os.getenv("SITE_IMPORT_TOKEN")
 SITE_ONLY = os.getenv("SITE_ONLY", "").lower() in ("1", "true", "yes")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "40") or 40)
 SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "60") or 60)
-WORK_HOURS = (7, 21)   # по Лондону: ночью не сканируем
+WORK_HOURS = (7, 21)   # по Брюсселю: ночью не сканируем
 
 SENT_FILE = Path(os.getenv("SENT_FILE", "crewell_sent.json"))
 
@@ -53,7 +53,7 @@ def log(msg=""):
 def london_now():
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Europe/London"))
+        return datetime.now(ZoneInfo("Europe/Brussels"))
     except Exception:
         return datetime.now()
 
@@ -79,6 +79,23 @@ def save_sent(sent):
 # ------------------------------------------------------------
 # САЙТ WAY AT SEA
 # ------------------------------------------------------------
+
+
+# ---------- Ответ сайта: «new» + готовый исправленный текст для бота ----------
+class SiteResult(str):
+    """Строка "new" (сравнение == "new" работает как раньше) + bot_text — исправленная сайтом вакансия."""
+    bot_text = None
+
+
+def _site_new(result):
+    r = SiteResult("new")
+    r.bot_text = ((result or {}).get("bot_text") or "").strip() or None
+    return r
+
+
+def bot_text_of(site, fallback):
+    """Текст для бота: исправленный сайтом, иначе старый."""
+    return getattr(site, "bot_text", None) or fallback
 
 def _site(path, payload=None):
     req = urllib.request.Request(
@@ -130,7 +147,7 @@ async def send_to_site(job):
             log(f"♻️ {job['id']}: дубль ({res.get('reason')})")
             return "duplicate"
         log(f"🌐 {job['id']}: на сайте")
-        return "new"
+        return _site_new(res)
     except urllib.error.HTTPError as e:
         log(f"❌ Сайт: HTTP {e.code} для {job['id']}")
     except Exception as e:
@@ -184,7 +201,7 @@ async def flush_bot_pending():
 # ------------------------------------------------------------
 
 def posted_at(text, now=None):
-    """Когда опубликована: «4h 52min ago», «1d 3h ago», «2 days ago», «just now», «вчера», «07.10.2026» → datetime (Лондон) или None."""
+    """Когда опубликована: «4h 52min ago», «1d 3h ago», «2 days ago», «just now», «вчера», «07.10.2026» → datetime (Брюссель) или None."""
     now = now or london_now()
     t = (text or "").lower()
     m = re.search(r"((?:\d+\s*(?:d|day|days|h|hr|hrs|hour|hours|min|mins|minute|minutes|m|s|sec|дн|день|дня|дней|ч|час|часа|часов|мин|минут|сек)\.?\s*)+)(?:ago|назад)", t)
@@ -213,7 +230,7 @@ def posted_at(text, now=None):
 
 
 def is_today(text):
-    """True — опубликована сегодня (по Лондону), False — раньше, None — не удалось понять."""
+    """True — опубликована сегодня (по Брюсселю), False — раньше, None — не удалось понять."""
     p = posted_at(text)
     if p is None:
         return None
@@ -418,7 +435,7 @@ async def scan(sent):
                 fresh = 0
                 for c in cards:
 
-                    # только опубликованные СЕГОДНЯ (по Лондону)
+                    # только опубликованные СЕГОДНЯ (по Брюсселю)
                     today = is_today(c["text"])
                     if today is None and c["id"] not in sent:
                         # на карточке времени нет — смотрим на странице вакансии
@@ -510,7 +527,7 @@ async def scan(sent):
                     save_sent(sent)
 
                     if site == "new" and not SITE_ONLY:
-                        await to_bot(make_message(job))
+                        await to_bot(bot_text_of(site, make_message(job)))
 
                     await asyncio.sleep(3)   # бережно к сайту
 
@@ -534,7 +551,7 @@ async def scan(sent):
 #  • robots.txt запрещает только поиск (?s=) и фильтры (?f_), поэтому
 #    список берём из карты сайта job-sitemap.xml (дата lastmod) и
 #    из раздела /jobs/job-category/offshore-marine/ — оба разрешены.
-#  • Только сегодняшние (lastmod = сегодня по Лондону), только Offshore Marine,
+#  • Только сегодняшние (lastmod = сегодня по Брюсселю), только Offshore Marine,
 #    только с e-mail консультанта на странице. Морскую должность проверяет сайт.
 # ============================================================
 
@@ -583,7 +600,7 @@ def parse_start(text):
 
 
 def atlas_today_urls(xml):
-    """URL вакансий с lastmod = сегодня (по Лондону)."""
+    """URL вакансий с lastmod = сегодня (по Брюсселю)."""
     today = london_now().date()
     out = []
     for loc, lastmod in re.findall(r"<loc>\s*([^<]+?)\s*</loc>\s*(?:<lastmod>\s*([^<]+?)\s*</lastmod>)?", xml or ""):
@@ -593,7 +610,7 @@ def atlas_today_urls(xml):
             dt = datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
             try:
                 from zoneinfo import ZoneInfo
-                dt = dt.astimezone(ZoneInfo("Europe/London"))
+                dt = dt.astimezone(ZoneInfo("Europe/Brussels"))
             except Exception:
                 pass
         except ValueError:
@@ -788,7 +805,7 @@ async def scan_atlas(sent):
                 save_sent(sent)
 
                 if site == "new" and not SITE_ONLY:
-                    await to_bot(make_message(job), "atlas")
+                    await to_bot(bot_text_of(site, make_message(job)), "atlas")
 
                 await asyncio.sleep(2)
 
@@ -1052,7 +1069,7 @@ async def scan_tos(sent):
                 save_sent(sent)
 
                 if site == "new" and not SITE_ONLY:
-                    await to_bot(make_message(job), "tospeople")
+                    await to_bot(bot_text_of(site, make_message(job)), "tospeople")
 
                 await asyncio.sleep(3)
 
@@ -1247,7 +1264,7 @@ async def scan_seaman(sent):
                 save_sent(sent)
 
                 if site == "new" and not SITE_ONLY:
-                    await to_bot(make_message(job), "seaman")
+                    await to_bot(bot_text_of(site, make_message(job)), "seaman")
 
                 await asyncio.sleep(3)
 
@@ -1263,7 +1280,7 @@ async def scan_seaman(sent):
         f"нет e-mail {stats['no_email']}, ошибок {stats['error']} ===")
 
 
-SCHEDULE = [tuple(int(x) for x in t.strip().split(":")) for t in os.getenv("SCHEDULE", "10:00,12:00,14:00,16:00").split(",") if t.strip()]
+SCHEDULE = [tuple(int(x) for x in t.strip().split(":")) for t in os.getenv("SCHEDULE", "09:00,11:00,13:00,15:00,17:00").split(",") if t.strip()]
 
 
 def next_run(now):
@@ -1300,7 +1317,7 @@ async def main():
 
     log("=== CREWELL + ATLAS + TOS + SEA-MAN VACANCIES PARSER STARTED ===")
     log(f"Сайт: {bool(SITE_IMPORT_URL and SITE_IMPORT_TOKEN)}  SITE_ONLY={SITE_ONLY}  только за сегодня  страниц ≤ {MAX_PAGES}")
-    log("Расписание (Лондон): " + ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE))
+    log("Расписание (Брюссель): " + ", ".join(f"{h:02d}:{m:02d}" for h, m in SCHEDULE))
 
     sent = load_sent()
     log(f"💾 В памяти: {len(sent)} вакансий")
