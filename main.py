@@ -7,7 +7,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #  • Контакт (e-mail) берём из НАШЕГО каталога компаний: компания crewell
 #    с тем же номером, что в ссылке /companies/ID/.
 #  • У компании нет e-mail → вакансию не собираем и не публикуем.
-#  • Берём ТОЛЬКО вакансии, опубликованные сегодня (по Брюсселю).
+#  • Берём ТОЛЬКО вакансии, опубликованные сегодня (по Румынии (Бухарест)).
 #  • Сначала сайт (он решает: новая / дубль / мусор), новые — в бот.
 #    Своего Telegram у этого парсера нет: сообщение кладём в очередь на сайте,
 #    его забирает и отправляет в бот Telegram-парсер.
@@ -17,7 +17,7 @@ print("=== CREWELL VACANCIES FILE LOADED ===", flush=True)
 #   SITE_IMPORT_TOKEN  тот же ключ, что IMPORT_TOKEN на сайте
 #   SITE_ONLY=1        (необязательно) только сайт, без бота
 #   MAX_PAGES=40       (необязательно) сколько страниц списка смотреть максимум
-#   SCHEDULE=09:00,11:00,13:00,15:00,17:00  (необязательно) когда проверять, по Брюсселю
+#   SCHEDULE=09:00,11:00,13:00,15:00,17:00  (необязательно) когда проверять, по Румынии (Бухарест)
 # ============================================================
 
 import asyncio
@@ -38,7 +38,7 @@ SITE_IMPORT_TOKEN = os.getenv("SITE_IMPORT_TOKEN")
 SITE_ONLY = os.getenv("SITE_ONLY", "").lower() in ("1", "true", "yes")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "40") or 40)
 SCAN_EVERY_MIN = int(os.getenv("SCAN_EVERY_MIN", "60") or 60)
-WORK_HOURS = (7, 21)   # по Брюсселю: ночью не сканируем
+WORK_HOURS = (7, 21)   # по Румынии (Бухарест): ночью не сканируем
 
 SENT_FILE = Path(os.getenv("SENT_FILE", "crewell_sent.json"))
 
@@ -53,7 +53,7 @@ def log(msg=""):
 def london_now():
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("Europe/Brussels"))
+        return datetime.now(ZoneInfo("Europe/Bucharest"))
     except Exception:
         return datetime.now()
 
@@ -230,7 +230,7 @@ def posted_at(text, now=None):
 
 
 def is_today(text):
-    """True — опубликована сегодня (по Брюсселю), False — раньше, None — не удалось понять."""
+    """True — опубликована сегодня (по Румынии (Бухарест)), False — раньше, None — не удалось понять."""
     p = posted_at(text)
     if p is None:
         return None
@@ -435,7 +435,7 @@ async def scan(sent):
                 fresh = 0
                 for c in cards:
 
-                    # только опубликованные СЕГОДНЯ (по Брюсселю)
+                    # только опубликованные СЕГОДНЯ (по Румынии (Бухарест))
                     today = is_today(c["text"])
                     if today is None and c["id"] not in sent:
                         # на карточке времени нет — смотрим на странице вакансии
@@ -551,7 +551,7 @@ async def scan(sent):
 #  • robots.txt запрещает только поиск (?s=) и фильтры (?f_), поэтому
 #    список берём из карты сайта job-sitemap.xml (дата lastmod) и
 #    из раздела /jobs/job-category/offshore-marine/ — оба разрешены.
-#  • Только сегодняшние (lastmod = сегодня по Брюсселю), только Offshore Marine,
+#  • Только сегодняшние (lastmod = сегодня по Румынии (Бухарест)), только Offshore Marine,
 #    только с e-mail консультанта на странице. Морскую должность проверяет сайт.
 # ============================================================
 
@@ -600,7 +600,7 @@ def parse_start(text):
 
 
 def atlas_today_urls(xml):
-    """URL вакансий с lastmod = сегодня (по Брюсселю)."""
+    """URL вакансий с lastmod = сегодня (по Румынии (Бухарест))."""
     today = london_now().date()
     out = []
     for loc, lastmod in re.findall(r"<loc>\s*([^<]+?)\s*</loc>\s*(?:<lastmod>\s*([^<]+?)\s*</lastmod>)?", xml or ""):
@@ -610,7 +610,7 @@ def atlas_today_urls(xml):
             dt = datetime.fromisoformat(lastmod.replace("Z", "+00:00"))
             try:
                 from zoneinfo import ZoneInfo
-                dt = dt.astimezone(ZoneInfo("Europe/Brussels"))
+                dt = dt.astimezone(ZoneInfo("Europe/Bucharest"))
             except Exception:
                 pass
         except ValueError:
